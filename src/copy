@@ -1,0 +1,101 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath, pathToFileURL } from 'url';
+ 
+const CONFIG = {
+  slabs: [
+    { upTo: 100000,   rate: 0.0200 },
+    { upTo: 500000,   rate: 0.0160 },
+    { upTo: 1000000,  rate: 0.0130 },
+    { upTo: Infinity, rate: 0.0110 }
+  ],
+  tenureMultipliers: { "3": 1.00, "5": 0.92, "10": 0.85 },
+  roundingNearest: 10,
+  minPremium: 1000
+};
+ 
+function roundToNearest(value, nearest = 10) {
+  return Math.round(value / nearest) * nearest;
+}
+ 
+function computeBaseAnnualPremium(sumInsured) {
+  const si = Number(sumInsured);
+  if (!Number.isFinite(si) || si <= 0) return CONFIG.minPremium;
+ 
+  let premium = 0;
+  let lastCap = 0;
+  for (const slab of CONFIG.slabs) {
+    const cap = slab.upTo;
+    const portion = Math.max(0, Math.min(si, cap) - lastCap);
+    if (portion <= 0) break;
+    premium += portion * slab.rate;
+    lastCap = cap;
+    if (si <= lastCap) break;
+  }
+  premium = Math.max(premium, CONFIG.minPremium);
+  return roundToNearest(premium, CONFIG.roundingNearest);
+}
+ 
+function buildPremiumByTenure(sumInsured) {
+  const baseAnnual = computeBaseAnnualPremium(sumInsured);
+  const map = {};
+  for (const key of Object.keys(CONFIG.tenureMultipliers)) {
+    const mult = CONFIG.tenureMultipliers[key];
+    const raw = baseAnnual * mult;
+    const floored = Math.max(raw, CONFIG.minPremium);
+    map[key] = roundToNearest(floored, CONFIG.roundingNearest);
+  }
+  return map;
+}
+ 
+function transformPolicies(policies) {
+  if (Array.isArray(policies)) {
+    return policies.map(p => ({
+      ...p,
+      premiumByTenure: buildPremiumByTenure(p.sumInsured)
+    }));
+  }
+  if (policies && Array.isArray(policies.policies)) {
+    return {
+      ...policies,
+      policies: policies.policies.map(p => ({
+        ...p,
+        premiumByTenure: buildPremiumByTenure(p.sumInsured)
+      }))
+    };
+  }
+  throw new Error('Input JSON must be an array of policy objects or an object with a "policies" array.');
+}
+ 
+async function main() {
+  const [ , , inputPathArg ] = process.argv;
+  if (!inputPathArg) {
+    console.error('Usage: node updatePremiumsInPlace.mjs <path/to/policies.json>');
+    process.exit(1);
+  }
+ 
+  const resolvedPath = path.resolve(process.cwd(), inputPathArg);
+  if (!fs.existsSync(resolvedPath)) {
+    console.error(`❌ File not found: ${resolvedPath}`);
+    process.exit(1);
+  }
+ 
+  try {
+    // Import JSON with assertion
+    const url = pathToFileURL(resolvedPath).href;
+    const module = await import(url, { assert: { type: 'json' } });
+    const policiesData = module.default;
+ 
+    const updated = transformPolicies(policiesData);
+ 
+    // Overwrite the SAME file in-place
+    fs.writeFileSync(resolvedPath, JSON.stringify(updated, null, 2), 'utf-8');
+    console.log(`✅ Updated in-place: ${resolvedPath}`);
+  } catch (err) {
+    console.error('❌ Error:', err.message);
+    process.exit(1);
+  }
+}
+ 
+main();
+ 
